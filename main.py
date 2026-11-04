@@ -1,77 +1,96 @@
-import math, time, requests, numpy as np, pandas as pd, yfinance as yf
+import os
+import math
+import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
-# Discord Webhook URL（セット済み）
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1276310470113890387/Tl3LNLFOGDQRSYKUQtRf-MZNNp3cJRI_kyATbCpNok_NSi7sRbrtri1ekwAi0nbzFCpw"
+# Render用のレスポンス対応ダミーサーバー
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # アクセスログの無駄な出力を防止
+
+def run_dummy_server():
+    try:
+        port = int(os.environ.get("PORT", 10000))
+        server = HTTPServer(("0.0.0.0", port), DummyHandler)
+        print(f"--> Web server started on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"--> Web server error: {e}")
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+# Discord Webhook URL
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1302821215437885501/kO79Cky4q2x9M_e3_E0sX34m9k93X"
 
 # AIパラメータ（学習済み設定）
-W_BB, W_RSI, W_MOM, W_ATR, BIAS, WIN_PROB_THRESH = 1.8, 1.4, -1.2, 0.6, -1.0, 0.65
+W_BB, W_RSI, W_MOM, W_ATR, BIAS, WIN_THRESHOLD = 0.35, 0.25, 0.25, 0.15, -0.1, 0.65
+
+def send_discord(message, win_prob, price, atr):
+    color = 0x00FF00 if win_prob >= 0.70 else 0xFFFF00
+    payload = {
+        "embeds": [{
+            "title": f"🚨 【逆神AI】{message} サイン発生！",
+            "color": color,
+            "fields": [
+                {"name": "現在価格 (XAU/USD)", "value": f"${price:.2f}", "inline": True},
+                {"name": "予測勝率", "value": f"{win_prob*100:.1f}%", "inline": True},
+                {"name": "ボラティリティ (ATR)", "value": f"${atr:.2f}", "inline": True}
+            ],
+            "footer": {"text": "24h Gold Monitoring Bot"}
+        }]
+    }
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    except Exception as e:
+        print(f"Discord Send Error: {e}")
 
 def check_market():
-    # ゴールド（1分足）の価格を取得
     df = yf.download(tickers="GC=F", period="1d", interval="1m", progress=False)
     if len(df) < 30: return
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
     close, high, low = df['Close'], df['High'], df['Low']
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
-    bb_up, bb_low = bb_mid + (bb_std * 2.0), bb_mid - (bb_std * 2.0)
     
-    # 指標計算
     delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(9).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(9).mean()
-    rsi = 100 - (100 / (1 + (gain / (loss + 1e-5))))
-    mom = close - close.shift(14)
-    tr = np.maximum(high - low, np.abs(high - close.shift(1)))
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / (loss + 1e-6)
+    rsi = 100 - (100 / (1 + rs))
+    
+    tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
     
-    # 養分（イナゴ飛び乗り）の検知
-    c1, c2 = close.iloc[-2], close.iloc[-3]
-    is_sucker_buy = (c2 <= bb_up.iloc[-3]) and (c1 > bb_up.iloc[-2])
-    is_sucker_sell = (c2 >= bb_low.iloc[-3]) and (c1 < bb_low.iloc[-2])
+    c, mid, std, r, a = close.iloc[-1], bb_mid.iloc[-1], bb_std.iloc[-1], rsi.iloc[-1], atr.iloc[-1]
     
-    if not is_sucker_buy and not is_sucker_sell: return
-
-    # スコア（勝率）計算
-    atr1, atr2 = atr.iloc[-2], atr.iloc[-3]
-    if is_sucker_buy:
-        f_bb = (c1 - bb_up.iloc[-2]) / (bb_up.iloc[-2] - bb_mid.iloc[-2] + 1e-5)
-        z = (W_BB * f_bb) + (W_RSI * ((rsi.iloc[-2] - 70)/30)) + (W_MOM * (mom.iloc[-2]/(atr1+1e-5))) + (W_ATR * ((atr1-atr2)/(atr2+1e-5))) + BIAS
-        prob = 1.0 / (1.0 + math.exp(-z))
-        if prob >= WIN_PROB_THRESH:
-            send_discord("SELL (売り)", prob, c1, atr1)
-
-    if is_sucker_sell:
-        f_bb = (bb_low.iloc[-2] - c1) / (bb_mid.iloc[-2] - bb_low.iloc[-2] + 1e-5)
-        z = (W_BB * f_bb) + (W_RSI * ((30 - rsi.iloc[-2])/30)) + (W_MOM * (-mom.iloc[-2]/(atr1+1e-5))) + (W_ATR * ((atr1-atr2)/(atr2+1e-5))) + BIAS
-        prob = 1.0 / (1.0 + math.exp(-z))
-        if prob >= WIN_PROB_THRESH:
-            send_discord("BUY (買い)", prob, c1, atr1)
-
-def send_discord(side, prob, price, atr_val):
-    color = 15158332 if side.startswith("SELL") else 3066993
-    tp = price - (atr_val * 4.5) if side.startswith("SELL") else price + (atr_val * 4.5)
-    sl = price + (atr_val * 2.5) if side.startswith("SELL") else price - (atr_val * 2.5)
+    score_sell = ((c - mid) / (std + 1e-6)) * W_BB + ((r - 50) / 20) * W_RSI + BIAS
+    score_buy = ((mid - c) / (std + 1e-6)) * W_BB + ((50 - r) / 20) * W_RSI + BIAS
     
-    payload = {
-        "embeds": [{
-            "title": f"🚨 【逆神AI】{side} サイン発生！",
-            "color": color,
-            "fields": [
-                {"name": "予測勝率", "value": f"**{prob*100:.1f}%**", "inline": True},
-                {"name": "現在価格", "value": f"${price:.2f}", "inline": True},
-                {"name": "利確目標 (+4.5 ATR)", "value": f"${tp:.2f}", "inline": False},
-                {"name": "損切目標 (-2.5 ATR)", "value": f"${sl:.2f}", "inline": False}
-            ]
-        }]
-    }
-    requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    prob_sell = 1 / (1 + math.exp(-score_sell))
+    prob_buy = 1 / (1 + math.exp(-score_buy))
+    
+    if prob_sell >= WIN_THRESHOLD:
+        send_discord("イナゴ高値掴みトラップ (SHORT推奨)", prob_sell, c, a)
+    elif prob_buy >= WIN_THRESHOLD:
+        send_discord("狼狽売り底値トラップ (LONG推奨)", prob_buy, c, a)
 
 # 24時間監視スタート
 while True:
     try:
         check_market()
-        time.sleep(60) # 1分ごとにチェック
+        time.sleep(60)
     except Exception as e:
         time.sleep(10)
